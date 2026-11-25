@@ -40,6 +40,20 @@ export interface EventDoc {
   createdAt: Date;
 }
 
+export type BillingStatus = 'none' | 'incomplete' | 'active' | 'past_due' | 'canceled';
+
+export interface BillingDoc {
+  workspace: string;
+  customerId?: string;
+  subscriptionId?: string;
+  status: BillingStatus;
+  seats: number;
+  cancelAtPeriodEnd?: boolean;
+  nextActionUrl?: string | null;
+  lastError?: string | null;
+  updatedAt: Date;
+}
+
 export interface NoteDoc {
   workspace: string;
   contact: string;
@@ -76,6 +90,7 @@ export async function getDb(): Promise<Db> {
       db.collection('messages').createIndex({ direction: 1, status: 1, nextAttemptAt: 1, leaseUntil: 1 }),
       db.collection('events').createIndex({ workspace: 1, seq: 1 }, { unique: true }),
       db.collection('notes').createIndex({ workspace: 1, contact: 1, createdAt: 1 }),
+      db.collection('billing').createIndex({ workspace: 1 }, { unique: true }),
     ]);
   }
   return db;
@@ -89,6 +104,7 @@ export async function collections() {
     messages: db.collection<MessageDoc>('messages'),
     events: db.collection<EventDoc>('events'),
     notes: db.collection<NoteDoc>('notes'),
+    billing: db.collection<BillingDoc>('billing'),
   };
 }
 

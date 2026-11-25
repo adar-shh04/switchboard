@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { collections, type MessageDoc, type OutboundStatus } from './db.js';
 import { emitWorkspaceEvent } from './events.js';
 import { getRedis } from './redis.js';
+import { verifyWebhookSignature } from './webhook-auth.js';
 
 const INSTANCE_ID = `srv_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
 const LEASE_MS = 20_000;
@@ -23,32 +24,7 @@ export function canTransitionStatus(current: OutboundStatus, next: OutboundStatu
 }
 
 export function verifyPigeonSignature(header: string | undefined, rawBody: Buffer, secret = config.pigeon.webhookSecret): boolean {
-  if (!header || typeof header !== 'string') return false;
-  let tStr = '';
-  let v1 = '';
-  for (const part of header.split(',')) {
-    const eq = part.indexOf('=');
-    if (eq <= 0) continue;
-    const k = part.slice(0, eq).trim();
-    const v = part.slice(eq + 1).trim();
-    if (k === 't') tStr = v;
-    else if (k === 'v1') v1 = v;
-  }
-  if (!tStr || !v1 || !/^\d+$/.test(tStr) || !/^[0-9a-f]+$/i.test(v1)) return false;
-
-  const t = Number(tStr);
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (Math.abs(nowSec - t) > 300) return false;
-
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(`${tStr}.`)
-    .update(rawBody)
-    .digest('hex');
-
-  const a = Buffer.from(v1.toLowerCase(), 'utf8');
-  const b = Buffer.from(expected.toLowerCase(), 'utf8');
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  return verifyWebhookSignature(header, rawBody, secret);
 }
 
 export async function handlePigeonWebhook(req: Request, res: Response): Promise<void> {

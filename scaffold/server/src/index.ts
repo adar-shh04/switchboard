@@ -1,6 +1,7 @@
 import express from 'express';
 import { createServer } from 'node:http';
 import { createAuthRouter } from './auth.js';
+import { handlePayboxWebhook } from './billing.js';
 import { config } from './config.js';
 import { closeDb, getDb } from './db.js';
 import { handlePigeonWebhook, startOutboundWorker, stopOutboundWorker } from './pigeon.js';
@@ -14,6 +15,13 @@ async function main() {
 
   const app = express();
 
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+  });
+
   app.get('/healthz', (_req, res) => {
     res.json({ ok: true });
   });
@@ -21,6 +29,9 @@ async function main() {
   // Raw body required for HMAC-SHA256 webhook signature verification
   app.post('/webhooks/pigeon', express.raw({ type: '*/*', limit: '1mb' }), (req, res, next) => {
     handlePigeonWebhook(req, res).catch(next);
+  });
+  app.post('/webhooks/paybox', express.raw({ type: '*/*', limit: '1mb' }), (req, res, next) => {
+    handlePayboxWebhook(req, res).catch(next);
   });
 
   app.use(express.json({ limit: '1mb' }));

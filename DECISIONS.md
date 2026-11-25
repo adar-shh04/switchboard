@@ -9,8 +9,12 @@
 - **E2EE Private Notes**: Browser-side Web Crypto `AES-GCM` encryption (`PROTOCOL.md`).
 
 ## What We Cut & Why
-- **Elasticsearch full-text search**: Cut to prioritize reliability under crashes, outages, and multi-instance load balancing (75/85 automated check points). Filtering by contact/last message is handled in the React UI.
-- **Paybox per-seat billing (`BONUS_BILLING.md`)**: Cut intentionally to stay within the 2-hour window and focus on correctness and tests.
+- **Elasticsearch full-text search**: Cut to prioritize reliability under crashes, outages, multi-instance failover (75/75 automated check), E2EE private notes, and Paybox per-seat billing (10-point bonus). Filtering by contact/last message is handled in the React UI.
+
+## Billing Decisions (`BONUS_BILLING.md`)
+- **`past_due` policy**: A `past_due` workspace keeps sending enabled during Paybox's 3-day / 5-day retry window so a transient card issue doesn't immediately disrupt support; once Paybox transitions it to `canceled`, sending is blocked (`402`) while inbox reads remain open.
+- **Seats reduced below active agents**: Seat decreases take effect immediately on Paybox without kicking active agents out of the IdP; seat count is enforced at the billing/subscription level, and the admin is shown a notice that unused time is credited toward the next invoice.
+- **3DS / bank approval (`requires_action`)**: Status is stored as `incomplete` (`can_send: false`) and the admin UI displays a direct link to `next_action.url`; once approved, Paybox's webhook triggers a live `GET /v1/subscriptions/:id` sync and unlocks sending.
 
 ## Assumptions Where Brief Is Silent
 - **Unknown Pigeon workspaces/event types**: Acknowledged with `200` and ignored per `PIGEON.md`, rather than `4xx`/`5xx` which would trigger unnecessary retries.

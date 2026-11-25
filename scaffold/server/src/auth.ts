@@ -176,6 +176,10 @@ export function createAuthRouter(): Router {
         const parts = tokens.id_token.split('.');
         if (parts.length === 3) {
           const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+          if (claims.nonce && claims.nonce !== pending.nonce) {
+            res.status(401).json({ error: 'invalid_nonce' });
+            return;
+          }
           user = {
             sub: claims.sub,
             name: claims.name,

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BillingModal } from './BillingModal';
 import {
   decryptNote,
   encryptNote,
@@ -65,6 +66,7 @@ export function App() {
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState('');
   const [showKeyBox, setShowKeyBox] = useState(false);
+  const [showBilling, setShowBilling] = useState(false);
 
   const lastSeqRef = useRef<number | null>(null);
   const selectedContactRef = useRef<string | null>(null);
@@ -245,11 +247,15 @@ export function App() {
         status: 'queued',
       },
     ]);
-    await fetch(`/api/conversations/${encodeURIComponent(selectedContact)}/reply`, {
+    const res = await fetch(`/api/conversations/${encodeURIComponent(selectedContact)}/reply`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ workspace, text, client_ref: clientRef }),
     });
+    if (res.status === 402) {
+      setErrorBanner('Sending paused: workspace subscription is inactive/canceled.');
+      setMessages((prev) => prev.filter((m) => m.clientRef !== clientRef));
+    }
     await loadConversations();
   }
 
@@ -308,6 +314,11 @@ export function App() {
           </span>
         </div>
         <div className="topbar-right">
+          {user.workspaces.find((w) => w.id === workspace)?.role === 'admin' && (
+            <button className="btn" onClick={() => setShowBilling(true)}>
+              Billing
+            </button>
+          )}
           <span style={{ fontSize: 13, color: 'var(--muted)' }}>{user.name || user.sub}</span>
           <button
             className="btn"
@@ -488,6 +499,9 @@ export function App() {
           )}
         </aside>
       </div>
+      {showBilling && workspace && (
+        <BillingModal workspace={workspace} onClose={() => setShowBilling(false)} />
+      )}
     </div>
   );
 }
