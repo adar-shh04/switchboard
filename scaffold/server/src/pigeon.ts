@@ -17,7 +17,12 @@ const STATUS_RANK: Record<OutboundStatus, number> = {
   failed: 3,
 };
 
-function verifyPigeonSignature(header: string | undefined, rawBody: Buffer): boolean {
+export function canTransitionStatus(current: OutboundStatus, next: OutboundStatus): boolean {
+  if (current === 'delivered' || current === 'failed') return false;
+  return STATUS_RANK[next] > STATUS_RANK[current];
+}
+
+export function verifyPigeonSignature(header: string | undefined, rawBody: Buffer, secret = config.pigeon.webhookSecret): boolean {
   if (!header || typeof header !== 'string') return false;
   let tStr = '';
   let v1 = '';
@@ -36,7 +41,7 @@ function verifyPigeonSignature(header: string | undefined, rawBody: Buffer): boo
   if (Math.abs(nowSec - t) > 300) return false;
 
   const expected = crypto
-    .createHmac('sha256', config.pigeon.webhookSecret)
+    .createHmac('sha256', secret)
     .update(`${tStr}.`)
     .update(rawBody)
     .digest('hex');
