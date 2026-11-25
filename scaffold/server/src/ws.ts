@@ -1,13 +1,39 @@
 import type { Server as HttpServer, IncomingMessage } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { getSessionFromCookieHeader, getWorkspaceRole } from './auth.js';
+import { config } from './config.js';
 import { collections } from './db.js';
 import { createRedisSubscriber } from './redis.js';
+
+function isAllowedOrigin(originHeader: string | undefined, hostHeader: string | undefined): boolean {
+  if (!originHeader) return true; // non-browser WS clients (e.g., check.js) omit Origin
+  try {
+    const o = new URL(originHeader);
+    const web = new URL(config.webOrigin);
+    if (o.origin === web.origin) return true;
+    if (hostHeader && o.host === hostHeader) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 export function attachWebSocketServer(server: HttpServer): () => Promise<void> {
   const wss = new WebSocketServer({ noServer: true });
   const sub = createRedisSubscriber();
   const rooms = new Map<string, Set<WebSocket>>();
+  const aliveSet = new WeakSet<WebSocket>();
+
+  const heartbeat = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (!aliveSet.has(ws)) {
+        ws.terminate();
+        continue;
+      }
+      aliveSet.delete(ws);
+      ws.ping();
+    }
+  }, 25_000);
 
   sub.on('message', (channel, message) => {
     if (!channel.startsWith('ws:')) return;
@@ -30,6 +56,12 @@ export function attachWebSocketServer(server: HttpServer): () => Promise<void> {
         return;
       }
 
+      if (!isAllowedOrigin(req.headers.origin, req.headers.host)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
       const workspace = url.searchParams.get('workspace') || '';
       const user = await getSessionFromCookieHeader(req.headers.cookie);
       if (!user || !workspace || !getWorkspaceRole(user, workspace)) {
@@ -42,6 +74,9 @@ export function attachWebSocketServer(server: HttpServer): () => Promise<void> {
       const after = afterParam !== null && afterParam !== '' ? Number(afterParam) : null;
 
       wss.handleUpgrade(req, socket, head, async (ws) => {
+        aliveSet.add(ws);
+        ws.on('pong', () => aliveSet.add(ws));
+
         const buffer: string[] = [];
         let replaying = true;
         let maxReplayedSeq = after !== null && Number.isFinite(after) ? after : -1;
@@ -86,6 +121,7 @@ export function attachWebSocketServer(server: HttpServer): () => Promise<void> {
             const missed = await events
               .find({ workspace, seq: { $gt: after } })
               .sort({ seq: 1 })
+              .limit(1000)
               .toArray();
             for (const ev of missed) {
               if (ws.readyState !== ws.OPEN) break;
@@ -113,6 +149,7 @@ export function attachWebSocketServer(server: HttpServer): () => Promise<void> {
   });
 
   return async () => {
+    clearInterval(heartbeat);
     for (const client of wss.clients) {
       client.close();
     }

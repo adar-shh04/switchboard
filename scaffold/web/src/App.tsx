@@ -38,7 +38,7 @@ interface Message {
   occurredAt: string;
   pigeonMessageId?: string;
   clientRef?: string;
-  status?: 'queued' | 'sending' | 'sent' | 'delivered' | 'failed';
+  status?: 'queued' | 'sending' | 'sent' | 'delivered' | 'failed' | 'network_error';
 }
 
 interface NoteItem {
@@ -109,7 +109,7 @@ export function App() {
       const decrypted = await Promise.all(
         rawNotes.map(async (n) => ({
           ...n,
-          plaintext: await decryptNote(workspace, n.ciphertext, n.iv),
+          plaintext: await decryptNote(workspace, contact, n.authorSub, n.ciphertext, n.iv),
         }))
       );
       setNotes(decrypted);
@@ -129,13 +129,33 @@ export function App() {
     }
   }, [selectedContact, loadThread]);
 
-  // Real-time WebSocket with seq replay on reconnect
+  // Real-time WebSocket with seq replay on reconnect and debounced refresh
   useEffect(() => {
     if (!workspace || !user) return;
     let closed = false;
     let ws: WebSocket | null = null;
     let retryTimer: number | undefined;
+    let convRefreshTimer: number | undefined;
+    let threadRefreshTimer: number | undefined;
     lastSeqRef.current = null;
+
+    const scheduleConvRefresh = () => {
+      if (convRefreshTimer) return;
+      convRefreshTimer = window.setTimeout(() => {
+        convRefreshTimer = undefined;
+        void loadConversations();
+      }, 150);
+    };
+
+    const scheduleThreadRefresh = (contact: string) => {
+      if (threadRefreshTimer) return;
+      threadRefreshTimer = window.setTimeout(() => {
+        threadRefreshTimer = undefined;
+        if (selectedContactRef.current === contact) {
+          void loadThread(contact);
+        }
+      }, 150);
+    };
 
     const connect = () => {
       if (closed) return;
@@ -151,14 +171,14 @@ export function App() {
           if (typeof frame.seq === 'number') {
             lastSeqRef.current = Math.max(lastSeqRef.current ?? -1, frame.seq);
           }
-          void loadConversations();
+          scheduleConvRefresh();
           if (frame.contact && frame.contact === selectedContactRef.current) {
             if (frame.type === 'message.status' && frame.client_ref) {
               setMessages((prev) =>
                 prev.map((m) => (m.clientRef === frame.client_ref ? { ...m, status: frame.status } : m))
               );
             } else {
-              void loadThread(frame.contact);
+              scheduleThreadRefresh(frame.contact);
             }
           }
         } catch {
@@ -176,6 +196,8 @@ export function App() {
     return () => {
       closed = true;
       if (retryTimer) clearTimeout(retryTimer);
+      if (convRefreshTimer) clearTimeout(convRefreshTimer);
+      if (threadRefreshTimer) clearTimeout(threadRefreshTimer);
       ws?.close();
     };
   }, [workspace, user, loadConversations, loadThread]);
@@ -230,40 +252,64 @@ export function App() {
     await loadConversations();
   }
 
+  async function sendReplyWithRef(contact: string, text: string, clientRef: string, isRetry = false) {
+    if (!workspace) return;
+    if (!isRetry) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          workspace,
+          contact,
+          direction: 'outbound',
+          text,
+          occurredAt: new Date().toISOString(),
+          clientRef,
+          status: 'queued',
+        },
+      ]);
+    } else {
+      setMessages((prev) =>
+        prev.map((m) => (m.clientRef === clientRef ? { ...m, status: 'queued' } : m))
+      );
+    }
+
+    try {
+      const res = await fetch(`/api/conversations/${encodeURIComponent(contact)}/reply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ workspace, text, client_ref: clientRef }),
+      });
+      if (res.status === 402) {
+        setErrorBanner('Sending paused: workspace subscription is inactive/canceled.');
+        setMessages((prev) => prev.filter((m) => m.clientRef !== clientRef));
+        return;
+      }
+      if (!res.ok) {
+        setMessages((prev) =>
+          prev.map((m) => (m.clientRef === clientRef ? { ...m, status: 'network_error' } : m))
+        );
+      }
+      await loadConversations();
+    } catch {
+      setMessages((prev) =>
+        prev.map((m) => (m.clientRef === clientRef ? { ...m, status: 'network_error' } : m))
+      );
+    }
+  }
+
   async function handleSendReply() {
     if (!selectedContact || !workspace || !replyText.trim()) return;
     const text = replyText.trim();
     const clientRef = `ui_${crypto.randomUUID()}`;
     setReplyText('');
-    setMessages((prev) => [
-      ...prev,
-      {
-        workspace,
-        contact: selectedContact,
-        direction: 'outbound',
-        text,
-        occurredAt: new Date().toISOString(),
-        clientRef,
-        status: 'queued',
-      },
-    ]);
-    const res = await fetch(`/api/conversations/${encodeURIComponent(selectedContact)}/reply`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ workspace, text, client_ref: clientRef }),
-    });
-    if (res.status === 402) {
-      setErrorBanner('Sending paused: workspace subscription is inactive/canceled.');
-      setMessages((prev) => prev.filter((m) => m.clientRef !== clientRef));
-    }
-    await loadConversations();
+    await sendReplyWithRef(selectedContact, text, clientRef, false);
   }
 
   async function handleAddNote() {
-    if (!selectedContact || !workspace || !noteText.trim()) return;
+    if (!selectedContact || !workspace || !user || !noteText.trim()) return;
     const text = noteText.trim();
     setNoteText('');
-    const { ciphertext, iv } = await encryptNote(workspace, text);
+    const { ciphertext, iv } = await encryptNote(workspace, selectedContact, user.sub, text);
     await fetch(`/api/conversations/${encodeURIComponent(selectedContact)}/notes`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -416,7 +462,20 @@ export function App() {
                     <div className="bubble">{m.text}</div>
                     <div className="msg-meta">
                       <span>{new Date(m.occurredAt).toLocaleTimeString()}</span>
-                      {m.direction === 'outbound' && m.status && <span>· {m.status}</span>}
+                      {m.direction === 'outbound' && m.status && (
+                        <span>
+                          · {m.status === 'network_error' ? 'send failed' : m.status}
+                          {m.status === 'network_error' && m.clientRef && (
+                            <button
+                              className="btn"
+                              style={{ marginLeft: 6, padding: '1px 6px', fontSize: 10 }}
+                              onClick={() => void sendReplyWithRef(m.contact, m.text, m.clientRef!, true)}
+                            >
+                              Retry
+                            </button>
+                          )}
+                        </span>
+                      )}
                     </div>
                   </div>
                 ))}

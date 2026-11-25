@@ -1,4 +1,4 @@
-import { MongoClient, type Collection, type Db } from 'mongodb';
+import { MongoClient, type Db } from 'mongodb';
 import { config } from './config.js';
 
 export interface ConversationDoc {
@@ -36,8 +36,14 @@ export interface EventDoc {
   workspace: string;
   seq: number;
   type: string;
+  dedupeKey?: string;
   payload: Record<string, unknown>;
   createdAt: Date;
+}
+
+export interface CounterDoc {
+  _id: string;
+  seq: number;
 }
 
 export type BillingStatus = 'none' | 'incomplete' | 'active' | 'past_due' | 'canceled';
@@ -89,6 +95,11 @@ export async function getDb(): Promise<Db> {
       db.collection('messages').createIndex({ workspace: 1, contact: 1, occurredAt: 1, _id: 1 }),
       db.collection('messages').createIndex({ direction: 1, status: 1, nextAttemptAt: 1, leaseUntil: 1 }),
       db.collection('events').createIndex({ workspace: 1, seq: 1 }, { unique: true }),
+      db.collection('events').createIndex(
+        { workspace: 1, dedupeKey: 1 },
+        { unique: true, partialFilterExpression: { dedupeKey: { $type: 'string' } } }
+      ),
+      db.collection('events').createIndex({ createdAt: 1 }, { expireAfterSeconds: 86400 }),
       db.collection('notes').createIndex({ workspace: 1, contact: 1, createdAt: 1 }),
       db.collection('billing').createIndex({ workspace: 1 }, { unique: true }),
     ]);
@@ -103,6 +114,7 @@ export async function collections() {
     conversations: db.collection<ConversationDoc>('conversations'),
     messages: db.collection<MessageDoc>('messages'),
     events: db.collection<EventDoc>('events'),
+    counters: db.collection<CounterDoc>('counters'),
     notes: db.collection<NoteDoc>('notes'),
     billing: db.collection<BillingDoc>('billing'),
   };

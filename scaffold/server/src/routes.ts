@@ -12,8 +12,29 @@ import {
 import { config } from './config.js';
 import { claimConversation, releaseConversation, setConversationStatus } from './conversations.js';
 import { collections } from './db.js';
-import { enqueueOutboundReply } from './pigeon.js';
+import { enqueueOutboundReply, isKnownWorkspace } from './pigeon.js';
 import { getRedis } from './redis.js';
+
+function asNonEmptyString(val: unknown): string | null {
+  return typeof val === 'string' && val.length > 0 ? val : null;
+}
+
+function asPositiveInt(val: unknown): number | null {
+  return typeof val === 'number' && Number.isInteger(val) && val >= 1 ? val : null;
+}
+
+function parsePaging(
+  limitQ: unknown,
+  offsetQ: unknown,
+  defaultLimit: number,
+  maxLimit: number
+): { limit: number; offset: number } {
+  const rawLim = typeof limitQ === 'string' && limitQ !== '' ? Number(limitQ) : defaultLimit;
+  const rawOff = typeof offsetQ === 'string' && offsetQ !== '' ? Number(offsetQ) : 0;
+  const limit = Number.isFinite(rawLim) ? Math.min(maxLimit, Math.max(1, Math.trunc(rawLim))) : defaultLimit;
+  const offset = Number.isFinite(rawOff) ? Math.max(0, Math.trunc(rawOff)) : 0;
+  return { limit, offset };
+}
 
 function requireGrader(req: Request, res: Response, next: NextFunction): void {
   const token = req.headers['x-grader-token'];
@@ -29,11 +50,12 @@ export function createApiRouter(): Router {
 
   // ---------------- Grader endpoints ----------------
   router.post('/__grader/reset', requireGrader, async (_req, res) => {
-    const { conversations, messages, events, notes, billing } = await collections();
+    const { conversations, messages, events, counters, notes, billing } = await collections();
     await Promise.all([
       conversations.deleteMany({}),
       messages.deleteMany({}),
       events.deleteMany({}),
+      counters.deleteMany({}),
       notes.deleteMany({}),
       billing.deleteMany({}),
     ]);
@@ -87,9 +109,7 @@ export function createApiRouter(): Router {
       return workspaces[ws];
     };
 
-    for (const b of bills) {
-      ensureWs(b.workspace);
-    }
+    for (const b of bills) ensureWs(b.workspace);
 
     for (const c of convs) {
       const ws = ensureWs(c.workspace);
@@ -114,12 +134,15 @@ export function createApiRouter(): Router {
   });
 
   router.post('/__grader/reply', requireGrader, async (req, res) => {
-    const { workspace, contact, text, client_ref } = req.body || {};
-    if (!workspace || !contact || typeof text !== 'string' || !client_ref) {
-      res.status(400).json({ error: 'missing_fields' });
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const contact = asNonEmptyString(req.body?.contact);
+    const text = typeof req.body?.text === 'string' ? req.body.text : null;
+    const clientRef = asNonEmptyString(req.body?.client_ref);
+    if (!workspace || !contact || text === null || !clientRef) {
+      res.status(400).json({ error: 'missing_or_invalid_fields' });
       return;
     }
-    if (!(workspace in config.pigeon.apiKeys)) {
+    if (!isKnownWorkspace(workspace)) {
       res.status(400).json({ error: 'unknown_workspace' });
       return;
     }
@@ -129,20 +152,22 @@ export function createApiRouter(): Router {
       return;
     }
     try {
-      await enqueueOutboundReply({ workspace, contact, text, clientRef: client_ref });
-      res.status(202).json({ ok: true, client_ref });
+      await enqueueOutboundReply({ workspace, contact, text, clientRef });
+      res.status(202).json({ ok: true, client_ref: clientRef });
     } catch (err: any) {
       res.status(err?.status || 400).json({ error: err?.message || 'reply_failed' });
     }
   });
 
   router.post('/__grader/billing/subscribe', requireGrader, async (req, res) => {
-    const { workspace, seats, token } = req.body || {};
-    if (!workspace || !token || typeof seats !== 'number' || seats < 1) {
-      res.status(400).json({ error: 'missing_fields' });
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const token = asNonEmptyString(req.body?.token);
+    const seats = asPositiveInt(req.body?.seats);
+    if (!workspace || !token || !seats) {
+      res.status(400).json({ error: 'missing_or_invalid_fields' });
       return;
     }
-    if (!(workspace in config.pigeon.apiKeys)) {
+    if (!isKnownWorkspace(workspace)) {
       res.status(400).json({ error: 'unknown_workspace' });
       return;
     }
@@ -151,12 +176,13 @@ export function createApiRouter(): Router {
   });
 
   router.post('/__grader/billing/seats', requireGrader, async (req, res) => {
-    const { workspace, seats } = req.body || {};
-    if (!workspace || typeof seats !== 'number' || seats < 1) {
-      res.status(400).json({ error: 'missing_fields' });
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const seats = asPositiveInt(req.body?.seats);
+    if (!workspace || !seats) {
+      res.status(400).json({ error: 'missing_or_invalid_fields' });
       return;
     }
-    if (!(workspace in config.pigeon.apiKeys)) {
+    if (!isKnownWorkspace(workspace)) {
       res.status(400).json({ error: 'unknown_workspace' });
       return;
     }
@@ -165,12 +191,14 @@ export function createApiRouter(): Router {
   });
 
   router.post('/__grader/claim', requireGrader, async (req, res) => {
-    const { workspace, contact, agent } = req.body || {};
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const contact = asNonEmptyString(req.body?.contact);
+    const agent = asNonEmptyString(req.body?.agent);
     if (!workspace || !contact || !agent) {
-      res.status(400).json({ error: 'missing_fields' });
+      res.status(400).json({ error: 'missing_or_invalid_fields' });
       return;
     }
-    if (!(workspace in config.pigeon.apiKeys)) {
+    if (!isKnownWorkspace(workspace)) {
       res.status(400).json({ error: 'unknown_workspace' });
       return;
     }
@@ -184,21 +212,20 @@ export function createApiRouter(): Router {
 
   // ---------------- Product API ----------------
   router.get('/api/conversations', requireAuth, async (req, res) => {
-    const workspace = typeof req.query.workspace === 'string' ? req.query.workspace : '';
+    const workspace = asNonEmptyString(req.query.workspace);
     if (!workspace || !getWorkspaceRole(req.user!, workspace)) {
       res.status(403).json({ error: 'forbidden' });
       return;
     }
     const status = typeof req.query.status === 'string' ? req.query.status : 'all';
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
-    const skip = Math.max(0, Number(req.query.offset || 0));
+    const { limit, offset } = parsePaging(req.query.limit, req.query.offset, 50, 100);
 
     const filter: Record<string, unknown> = { workspace };
     if (status === 'open' || status === 'closed') filter.status = status;
 
     const { conversations } = await collections();
     const [items, total] = await Promise.all([
-      conversations.find(filter).sort({ lastMessageAt: -1 }).skip(skip).limit(limit).toArray(),
+      conversations.find(filter).sort({ lastMessageAt: -1 }).skip(offset).limit(limit).toArray(),
       conversations.countDocuments(filter),
     ]);
 
@@ -206,22 +233,25 @@ export function createApiRouter(): Router {
   });
 
   router.get('/api/conversations/:contact/messages', requireAuth, async (req, res) => {
-    const workspace = typeof req.query.workspace === 'string' ? req.query.workspace : '';
+    const workspace = asNonEmptyString(req.query.workspace);
     if (!workspace || !getWorkspaceRole(req.user!, workspace)) {
       res.status(403).json({ error: 'forbidden' });
       return;
     }
     const contact = decodeURIComponent(req.params.contact);
+    const { limit, offset } = parsePaging(req.query.limit, req.query.offset, 200, 500);
     const { messages } = await collections();
     const items = await messages
       .find({ workspace, contact })
       .sort({ occurredAt: 1, _id: 1 })
+      .skip(offset)
+      .limit(limit)
       .toArray();
     res.json({ messages: items });
   });
 
   router.post('/api/conversations/:contact/claim', requireAuth, async (req, res) => {
-    const workspace = typeof req.body?.workspace === 'string' ? req.body.workspace : '';
+    const workspace = asNonEmptyString(req.body?.workspace);
     if (!workspace || !getWorkspaceRole(req.user!, workspace)) {
       res.status(403).json({ error: 'forbidden' });
       return;
@@ -236,20 +266,28 @@ export function createApiRouter(): Router {
   });
 
   router.post('/api/conversations/:contact/release', requireAuth, async (req, res) => {
-    const workspace = typeof req.body?.workspace === 'string' ? req.body.workspace : '';
-    if (!workspace || !getWorkspaceRole(req.user!, workspace)) {
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const role = workspace ? getWorkspaceRole(req.user!, workspace) : null;
+    if (!workspace || !role) {
       res.status(403).json({ error: 'forbidden' });
       return;
     }
     const contact = decodeURIComponent(req.params.contact);
+    const { conversations } = await collections();
+    const existing = await conversations.findOne({ workspace, contact });
+    if (existing?.assignee && existing.assignee !== req.user!.sub && role !== 'admin') {
+      res.status(403).json({ error: 'only_holder_or_admin_can_release', assignee: existing.assignee });
+      return;
+    }
     await releaseConversation({ workspace, contact });
     res.json({ ok: true });
   });
 
   router.post('/api/conversations/:contact/status', requireAuth, async (req, res) => {
-    const workspace = typeof req.body?.workspace === 'string' ? req.body.workspace : '';
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const role = workspace ? getWorkspaceRole(req.user!, workspace) : null;
     const status = req.body?.status;
-    if (!workspace || !getWorkspaceRole(req.user!, workspace)) {
+    if (!workspace || !role) {
       res.status(403).json({ error: 'forbidden' });
       return;
     }
@@ -258,17 +296,20 @@ export function createApiRouter(): Router {
       return;
     }
     const contact = decodeURIComponent(req.params.contact);
+    const { conversations } = await collections();
+    const existing = await conversations.findOne({ workspace, contact });
+    if (existing?.assignee && existing.assignee !== req.user!.sub && role !== 'admin') {
+      res.status(403).json({ error: 'only_holder_or_admin_can_change_status', assignee: existing.assignee });
+      return;
+    }
     await setConversationStatus({ workspace, contact, status });
     res.json({ ok: true, status });
   });
 
   router.post('/api/conversations/:contact/reply', requireAuth, async (req, res) => {
-    const workspace = typeof req.body?.workspace === 'string' ? req.body.workspace : '';
+    const workspace = asNonEmptyString(req.body?.workspace);
     const text = typeof req.body?.text === 'string' ? req.body.text : '';
-    const clientRef =
-      typeof req.body?.client_ref === 'string' && req.body.client_ref
-        ? req.body.client_ref
-        : `ui_${crypto.randomUUID()}`;
+    const clientRef = asNonEmptyString(req.body?.client_ref) ?? `ui_${crypto.randomUUID()}`;
 
     if (!workspace || !getWorkspaceRole(req.user!, workspace)) {
       res.status(403).json({ error: 'forbidden' });
@@ -292,7 +333,7 @@ export function createApiRouter(): Router {
 
   // ---------------- Billing (Admin only) ----------------
   router.get('/api/billing', requireAuth, async (req, res) => {
-    const workspace = typeof req.query.workspace === 'string' ? req.query.workspace : '';
+    const workspace = asNonEmptyString(req.query.workspace);
     if (!workspace || getWorkspaceRole(req.user!, workspace) !== 'admin') {
       res.status(403).json({ error: 'admin_only' });
       return;
@@ -307,14 +348,14 @@ export function createApiRouter(): Router {
   });
 
   router.post('/api/billing/subscribe', requireAuth, async (req, res) => {
-    const workspace = typeof req.body?.workspace === 'string' ? req.body.workspace : '';
-    const token = typeof req.body?.token === 'string' ? req.body.token : '';
-    const seats = Number(req.body?.seats || 1);
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const token = asNonEmptyString(req.body?.token);
+    const seats = asPositiveInt(req.body?.seats ?? 1);
     if (!workspace || getWorkspaceRole(req.user!, workspace) !== 'admin') {
       res.status(403).json({ error: 'admin_only' });
       return;
     }
-    if (!token || !Number.isInteger(seats) || seats < 1) {
+    if (!token || !seats) {
       res.status(400).json({ error: 'invalid_billing_params' });
       return;
     }
@@ -329,13 +370,13 @@ export function createApiRouter(): Router {
   });
 
   router.post('/api/billing/seats', requireAuth, async (req, res) => {
-    const workspace = typeof req.body?.workspace === 'string' ? req.body.workspace : '';
-    const seats = Number(req.body?.seats || 0);
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const seats = asPositiveInt(req.body?.seats);
     if (!workspace || getWorkspaceRole(req.user!, workspace) !== 'admin') {
       res.status(403).json({ error: 'admin_only' });
       return;
     }
-    if (!Number.isInteger(seats) || seats < 1) {
+    if (!seats) {
       res.status(400).json({ error: 'invalid_seats' });
       return;
     }
@@ -344,7 +385,7 @@ export function createApiRouter(): Router {
   });
 
   router.post('/api/billing/cancel', requireAuth, async (req, res) => {
-    const workspace = typeof req.body?.workspace === 'string' ? req.body.workspace : '';
+    const workspace = asNonEmptyString(req.body?.workspace);
     if (!workspace || getWorkspaceRole(req.user!, workspace) !== 'admin') {
       res.status(403).json({ error: 'admin_only' });
       return;
@@ -355,7 +396,7 @@ export function createApiRouter(): Router {
 
   // Private notes (stored as opaque client-encrypted ciphertext)
   router.get('/api/conversations/:contact/notes', requireAuth, async (req, res) => {
-    const workspace = typeof req.query.workspace === 'string' ? req.query.workspace : '';
+    const workspace = asNonEmptyString(req.query.workspace);
     if (!workspace || !getWorkspaceRole(req.user!, workspace)) {
       res.status(403).json({ error: 'forbidden' });
       return;
@@ -367,9 +408,9 @@ export function createApiRouter(): Router {
   });
 
   router.post('/api/conversations/:contact/notes', requireAuth, async (req, res) => {
-    const workspace = typeof req.body?.workspace === 'string' ? req.body.workspace : '';
-    const ciphertext = typeof req.body?.ciphertext === 'string' ? req.body.ciphertext : '';
-    const iv = typeof req.body?.iv === 'string' ? req.body.iv : '';
+    const workspace = asNonEmptyString(req.body?.workspace);
+    const ciphertext = asNonEmptyString(req.body?.ciphertext);
+    const iv = asNonEmptyString(req.body?.iv);
     if (!workspace || !getWorkspaceRole(req.user!, workspace)) {
       res.status(403).json({ error: 'forbidden' });
       return;

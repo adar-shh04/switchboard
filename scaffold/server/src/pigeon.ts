@@ -7,8 +7,9 @@ import { getRedis } from './redis.js';
 import { verifyWebhookSignature } from './webhook-auth.js';
 
 const INSTANCE_ID = `srv_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
-const LEASE_MS = 20_000;
+const LEASE_MS = 18_000;
 const HTTP_TIMEOUT_MS = 14_000;
+const MAX_ATTEMPTS = 25;
 
 const STATUS_RANK: Record<OutboundStatus, number> = {
   queued: 0,
@@ -18,12 +19,20 @@ const STATUS_RANK: Record<OutboundStatus, number> = {
   failed: 3,
 };
 
+export function isKnownWorkspace(workspace: unknown): workspace is string {
+  return typeof workspace === 'string' && Object.hasOwn(config.pigeon.apiKeys, workspace);
+}
+
 export function canTransitionStatus(current: OutboundStatus, next: OutboundStatus): boolean {
   if (current === 'delivered' || current === 'failed') return false;
   return STATUS_RANK[next] > STATUS_RANK[current];
 }
 
-export function verifyPigeonSignature(header: string | undefined, rawBody: Buffer, secret = config.pigeon.webhookSecret): boolean {
+export function verifyPigeonSignature(
+  header: string | undefined,
+  rawBody: Buffer,
+  secret = config.pigeon.webhookSecret
+): boolean {
   return verifyWebhookSignature(header, rawBody, secret);
 }
 
@@ -48,9 +57,8 @@ export async function handlePigeonWebhook(req: Request, res: Response): Promise<
     return;
   }
 
-  const workspace = typeof event.workspace === 'string' ? event.workspace : '';
-  if (!workspace || !(workspace in config.pigeon.apiKeys)) {
-    // Unknown workspace: acknowledge 2xx and ignore per PIGEON.md
+  const workspace = event.workspace;
+  if (!isKnownWorkspace(workspace)) {
     res.status(200).json({ ok: true, ignored: 'unknown_workspace' });
     return;
   }
@@ -70,7 +78,7 @@ export async function handlePigeonWebhook(req: Request, res: Response): Promise<
       return;
     }
 
-    const upsertMsg = await messages.updateOne(
+    await messages.updateOne(
       { workspace, pigeonMessageId: messageId },
       {
         $setOnInsert: {
@@ -88,29 +96,44 @@ export async function handlePigeonWebhook(req: Request, res: Response): Promise<
       { upsert: true }
     );
 
-    if (upsertMsg.upsertedCount > 0) {
-      await conversations.updateOne(
-        { workspace, contact: from },
+    // Always run idempotent conversation upsert + deduped event emission so
+    // a crash mid-webhook recovers cleanly on Pigeon retry.
+    // Conditional $set ensures an older out-of-order message never overwrites newer lastMessageText.
+    await conversations.updateOne(
+      { workspace, contact: from },
+      [
         {
-          $setOnInsert: {
+          $set: {
             workspace,
             contact: from,
-            assignee: null,
-            status: 'open',
+            assignee: { $ifNull: ['$assignee', null] },
+            status: { $ifNull: ['$status', 'open'] },
+            lastMessageText: {
+              $cond: [
+                { $gte: [occurredAt, { $ifNull: ['$lastMessageAt', new Date(0)] }] },
+                text,
+                { $ifNull: ['$lastMessageText', text] },
+              ],
+            },
+            lastMessageAt: { $max: [{ $ifNull: ['$lastMessageAt', occurredAt] }, occurredAt] },
+            updatedAt: now,
           },
-          $max: { lastMessageAt: occurredAt },
-          $set: { lastMessageText: text, updatedAt: now },
         },
-        { upsert: true }
-      );
+      ],
+      { upsert: true }
+    );
 
-      await emitWorkspaceEvent(workspace, 'message.inbound', {
+    await emitWorkspaceEvent(
+      workspace,
+      'message.inbound',
+      {
         contact: from,
         message_id: messageId,
         text,
         occurred_at: occurredAt.toISOString(),
-      });
-    }
+      },
+      `in:${messageId}`
+    );
 
     res.status(200).json({ ok: true });
     return;
@@ -120,14 +143,13 @@ export async function handlePigeonWebhook(req: Request, res: Response): Promise<
     const data = event.data || {};
     const clientRef = typeof data.client_ref === 'string' ? data.client_ref : '';
     const nextStatus = typeof data.status === 'string' ? (data.status as OutboundStatus) : null;
-    if (!clientRef || !nextStatus || !(nextStatus in STATUS_RANK)) {
+    if (!clientRef || !nextStatus || !Object.hasOwn(STATUS_RANK, nextStatus)) {
       res.status(200).json({ ok: true, ignored: 'invalid_status' });
       return;
     }
 
     const existing = await messages.findOne({ workspace, direction: 'outbound', clientRef });
     if (!existing) {
-      // Status for a message we never sent: 2xx and ignore per PIGEON.md
       res.status(200).json({ ok: true, ignored: 'unknown_message' });
       return;
     }
@@ -139,6 +161,7 @@ export async function handlePigeonWebhook(req: Request, res: Response): Promise<
           ? ['queued', 'sending', 'sent']
           : [];
 
+    let shouldEmit = existing.status === nextStatus;
     if (allowedPrev.length > 0) {
       const upd = await messages.findOneAndUpdate(
         { _id: existing._id, status: { $in: allowedPrev } },
@@ -153,21 +176,26 @@ export async function handlePigeonWebhook(req: Request, res: Response): Promise<
         },
         { returnDocument: 'after' }
       );
+      if (upd) shouldEmit = true;
+    }
 
-      if (upd) {
-        await emitWorkspaceEvent(workspace, 'message.status', {
-          contact: upd.contact,
+    if (shouldEmit) {
+      await emitWorkspaceEvent(
+        workspace,
+        'message.status',
+        {
+          contact: existing.contact,
           client_ref: clientRef,
           status: nextStatus,
-        });
-      }
+        },
+        `st:${clientRef}:${nextStatus}`
+      );
     }
 
     res.status(200).json({ ok: true });
     return;
   }
 
-  // Unknown event type: 2xx per PIGEON.md
   res.status(200).json({ ok: true, ignored: 'unknown_type' });
 }
 
@@ -178,8 +206,8 @@ export async function enqueueOutboundReply(params: {
   clientRef: string;
 }): Promise<{ ok: true; clientRef: string }> {
   const { workspace, contact, text, clientRef } = params;
-  if (!(workspace in config.pigeon.apiKeys)) {
-    const err = new Error(`Unknown workspace: ${workspace}`) as Error & { status?: number };
+  if (!isKnownWorkspace(workspace)) {
+    const err = new Error(`Unknown workspace`) as Error & { status?: number };
     err.status = 400;
     throw err;
   }
@@ -228,8 +256,6 @@ export async function enqueueOutboundReply(params: {
   return { ok: true, clientRef };
 }
 
-// Atomic Redis token bucket + shared cool-off check.
-// Returns 0 if allowed to send now, or positive delay in ms to wait.
 const RATE_LIMIT_LUA = `
 local coolKey = KEYS[1]
 local tbKey = KEYS[2]
@@ -291,16 +317,38 @@ async function setSharedCooloff(workspace: string, delayMs: number): Promise<voi
   }
 }
 
+async function markFailed(msg: MessageDoc & { _id: any }, reason: string): Promise<void> {
+  const { messages } = await collections();
+  const upd = await messages.findOneAndUpdate(
+    { _id: msg._id, status: { $in: ['queued', 'sending'] } },
+    {
+      $set: {
+        status: 'failed',
+        lastError: reason,
+        leaseOwner: null,
+        leaseUntil: null,
+        updatedAt: new Date(),
+      },
+    },
+    { returnDocument: 'after' }
+  );
+  if (upd && msg.clientRef) {
+    await emitWorkspaceEvent(
+      msg.workspace,
+      'message.status',
+      { contact: msg.contact, client_ref: msg.clientRef, status: 'failed' },
+      `st:${msg.clientRef}:failed`
+    );
+  }
+}
+
 async function processOneMessage(msg: MessageDoc & { _id: any }): Promise<void> {
   const { messages } = await collections();
-  const apiKey = config.pigeon.apiKeys[msg.workspace];
-  if (!apiKey) {
-    await messages.updateOne(
-      { _id: msg._id },
-      { $set: { status: 'failed', lastError: 'missing_api_key', leaseOwner: null, leaseUntil: null, updatedAt: new Date() } }
-    );
+  if (!isKnownWorkspace(msg.workspace)) {
+    await markFailed(msg, 'missing_api_key');
     return;
   }
+  const apiKey = config.pigeon.apiKeys[msg.workspace];
 
   const waitMs = await acquireSendSlot(msg.workspace);
   if (waitMs > 0) {
@@ -343,15 +391,26 @@ async function processOneMessage(msg: MessageDoc & { _id: any }): Promise<void> 
         },
         { returnDocument: 'after' }
       );
-      if (upd) {
-        await emitWorkspaceEvent(msg.workspace, 'message.status', {
-          contact: msg.contact,
-          client_ref: msg.clientRef,
-          status: 'sent',
-        });
+      if (upd && msg.clientRef) {
+        await emitWorkspaceEvent(
+          msg.workspace,
+          'message.status',
+          {
+            contact: msg.contact,
+            client_ref: msg.clientRef,
+            status: 'sent',
+          },
+          `st:${msg.clientRef}:sent`
+        );
       } else {
         await messages.updateOne({ _id: msg._id }, { $set: { leaseOwner: null, leaseUntil: null } });
       }
+      return;
+    }
+
+    // Non-429 4xx errors cannot succeed on retry -> mark terminal failed
+    if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+      await markFailed(msg, `http_${res.status}`);
       return;
     }
 
@@ -375,8 +434,11 @@ async function processOneMessage(msg: MessageDoc & { _id: any }): Promise<void> 
       return;
     }
 
-    // 503 or other transient error: back off shared across instances
     const attempts = (msg.attempts || 0) + 1;
+    if (attempts >= MAX_ATTEMPTS) {
+      await markFailed(msg, `max_attempts_http_${res.status}`);
+      return;
+    }
     const backoffMs = Math.min(5000, 1000 * Math.pow(2, Math.min(attempts - 1, 2)));
     if (res.status >= 500) {
       await setSharedCooloff(msg.workspace, Math.min(2500, backoffMs));
@@ -395,8 +457,11 @@ async function processOneMessage(msg: MessageDoc & { _id: any }): Promise<void> 
       }
     );
   } catch (err) {
-    // Timeout or network error: release lease and retry with Idempotency-Key
     const attempts = (msg.attempts || 0) + 1;
+    if (attempts >= MAX_ATTEMPTS) {
+      await markFailed(msg, 'max_attempts_network');
+      return;
+    }
     const backoffMs = Math.min(5000, 1000 * Math.pow(2, Math.min(attempts - 1, 2)));
     await messages.updateOne(
       { _id: msg._id },
@@ -414,19 +479,19 @@ async function processOneMessage(msg: MessageDoc & { _id: any }): Promise<void> 
   }
 }
 
+// Continuous worker pool so one slow 12s Pigeon call does not stall other messages.
 let workerRunning = false;
 let workerTimer: NodeJS.Timeout | undefined;
-let pumping = false;
+let activeSlots = 0;
+let filling = false;
+const MAX_CONCURRENCY = 6;
 
-async function pumpOutbound(): Promise<void> {
-  if (!workerRunning || pumping) return;
-  pumping = true;
+async function fillPool(): Promise<void> {
+  if (!workerRunning || filling) return;
+  filling = true;
   try {
     const { messages } = await collections();
-    const inFlight: Promise<void>[] = [];
-    const MAX_CONCURRENCY = 6;
-
-    while (workerRunning && inFlight.length < MAX_CONCURRENCY) {
+    while (workerRunning && activeSlots < MAX_CONCURRENCY) {
       const now = new Date();
       const doc = await messages.findOneAndUpdate(
         {
@@ -447,22 +512,24 @@ async function pumpOutbound(): Promise<void> {
       );
 
       if (!doc) break;
-      inFlight.push(processOneMessage(doc as MessageDoc & { _id: any }));
-    }
-
-    if (inFlight.length > 0) {
-      await Promise.allSettled(inFlight);
+      activeSlots++;
+      void processOneMessage(doc as MessageDoc & { _id: any })
+        .catch(() => {})
+        .finally(() => {
+          activeSlots--;
+          if (workerRunning) void fillPool();
+        });
     }
   } catch {
     // ignore transient DB errors during reset/shutdown
   } finally {
-    pumping = false;
+    filling = false;
   }
 }
 
 export function wakeWorker(): void {
   if (workerRunning) {
-    void pumpOutbound();
+    void fillPool();
   }
 }
 
@@ -470,9 +537,9 @@ export function startOutboundWorker(): void {
   if (workerRunning) return;
   workerRunning = true;
   workerTimer = setInterval(() => {
-    void pumpOutbound();
+    void fillPool();
   }, 250);
-  void pumpOutbound();
+  void fillPool();
 }
 
 export function stopOutboundWorker(): void {

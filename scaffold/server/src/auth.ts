@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response, Router } from 'express';
 import express from 'express';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { config } from './config.js';
 import { getRedis } from './redis.js';
 
@@ -31,9 +32,11 @@ interface OidcDiscovery {
   authorization_endpoint: string;
   token_endpoint: string;
   userinfo_endpoint: string;
+  jwks_uri: string;
 }
 
 let cachedDiscovery: OidcDiscovery | undefined;
+let cachedJwks: ReturnType<typeof createRemoteJWKSet> | undefined;
 
 async function getDiscovery(): Promise<OidcDiscovery> {
   if (cachedDiscovery) return cachedDiscovery;
@@ -45,6 +48,13 @@ async function getDiscovery(): Promise<OidcDiscovery> {
   return cachedDiscovery;
 }
 
+async function getJwks() {
+  if (cachedJwks) return cachedJwks;
+  const discovery = await getDiscovery();
+  cachedJwks = createRemoteJWKSet(new URL(discovery.jwks_uri));
+  return cachedJwks;
+}
+
 export function parseCookies(header: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   if (!header) return out;
@@ -53,7 +63,11 @@ export function parseCookies(header: string | undefined): Record<string, string>
     if (idx <= 0) continue;
     const k = part.slice(0, idx).trim();
     const v = part.slice(idx + 1).trim();
-    out[k] = decodeURIComponent(v);
+    try {
+      out[k] = decodeURIComponent(v);
+    } catch {
+      out[k] = v;
+    }
   }
   return out;
 }
@@ -97,11 +111,7 @@ export function createAuthRouter(): Router {
       const verifier = crypto.randomBytes(32).toString('base64url');
       const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
 
-      await getRedis().setex(
-        `oidc:${state}`,
-        600,
-        JSON.stringify({ verifier, nonce })
-      );
+      await getRedis().setex(`oidc:${state}`, 600, JSON.stringify({ verifier, nonce }));
 
       const authUrl = new URL(discovery.authorization_endpoint);
       authUrl.searchParams.set('client_id', config.oidc.clientId);
@@ -115,7 +125,8 @@ export function createAuthRouter(): Router {
 
       res.redirect(302, authUrl.toString());
     } catch (err) {
-      res.status(502).json({ error: 'oidc_unavailable', detail: String(err) });
+      console.error('OIDC login error:', err);
+      res.status(502).json({ error: 'oidc_unavailable' });
     }
   });
 
@@ -154,13 +165,35 @@ export function createAuthRouter(): Router {
         signal: AbortSignal.timeout(5000),
       });
       if (!tokenRes.ok) {
-        const txt = await tokenRes.text();
-        res.status(401).json({ error: 'token_exchange_failed', detail: txt });
+        console.error('Token exchange failed:', tokenRes.status);
+        res.status(401).json({ error: 'token_exchange_failed' });
         return;
       }
 
       const tokens = (await tokenRes.json()) as { access_token?: string; id_token?: string };
-      let user: SessionUser | null = null;
+      if (!tokens.id_token) {
+        res.status(401).json({ error: 'missing_id_token' });
+        return;
+      }
+
+      // Verify ID token RS256 signature, issuer, audience, expiry, and nonce via JWKS
+      const jwks = await getJwks();
+      const { payload } = await jwtVerify(tokens.id_token, jwks, {
+        issuer: config.oidc.issuer,
+        audience: config.oidc.clientId,
+      });
+
+      if (payload.nonce !== pending.nonce || typeof payload.sub !== 'string') {
+        res.status(401).json({ error: 'invalid_id_token_claims' });
+        return;
+      }
+
+      let user: SessionUser = {
+        sub: payload.sub,
+        name: typeof payload.name === 'string' ? payload.name : undefined,
+        email: typeof payload.email === 'string' ? payload.email : undefined,
+        workspaces: Array.isArray(payload.workspaces) ? (payload.workspaces as WorkspaceClaim[]) : [],
+      };
 
       if (tokens.access_token) {
         const uiRes = await fetch(discovery.userinfo_endpoint, {
@@ -168,30 +201,11 @@ export function createAuthRouter(): Router {
           signal: AbortSignal.timeout(5000),
         });
         if (uiRes.ok) {
-          user = (await uiRes.json()) as SessionUser;
-        }
-      }
-
-      if (!user && tokens.id_token) {
-        const parts = tokens.id_token.split('.');
-        if (parts.length === 3) {
-          const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-          if (claims.nonce && claims.nonce !== pending.nonce) {
-            res.status(401).json({ error: 'invalid_nonce' });
-            return;
+          const ui = (await uiRes.json()) as SessionUser;
+          if (ui.sub === user.sub) {
+            user = ui;
           }
-          user = {
-            sub: claims.sub,
-            name: claims.name,
-            email: claims.email,
-            workspaces: Array.isArray(claims.workspaces) ? claims.workspaces : [],
-          };
         }
-      }
-
-      if (!user || !user.sub) {
-        res.status(401).json({ error: 'invalid_user_claims' });
-        return;
       }
 
       const sid = crypto.randomBytes(24).toString('hex');
@@ -203,7 +217,8 @@ export function createAuthRouter(): Router {
       );
       res.redirect(302, config.webOrigin);
     } catch (err) {
-      res.status(502).json({ error: 'oidc_callback_error', detail: String(err) });
+      console.error('OIDC callback error:', err);
+      res.status(401).json({ error: 'oidc_verification_failed' });
     }
   });
 
