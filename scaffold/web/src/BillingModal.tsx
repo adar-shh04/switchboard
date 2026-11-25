@@ -203,9 +203,9 @@ export function BillingModal({
                     />
                   </label>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
-                    <input value={expMonth} onChange={(e) => setExpMonth(e.target.value)} placeholder="MM" style={{ padding: 7, border: '1px solid var(--border)', borderRadius: 6 }} />
-                    <input value={expYear} onChange={(e) => setExpYear(e.target.value)} placeholder="YYYY" style={{ padding: 7, border: '1px solid var(--border)', borderRadius: 6 }} />
-                    <input value={cvc} onChange={(e) => setCvc(e.target.value)} placeholder="CVC" style={{ padding: 7, border: '1px solid var(--border)', borderRadius: 6 }} />
+                    <input value={expMonth} onChange={(e) => setExpMonth(e.target.value)} placeholder="MM" style={{ width: '100%', minWidth: 0, padding: 7, border: '1px solid var(--border)', borderRadius: 6 }} />
+                    <input value={expYear} onChange={(e) => setExpYear(e.target.value)} placeholder="YYYY" style={{ width: '100%', minWidth: 0, padding: 7, border: '1px solid var(--border)', borderRadius: 6 }} />
+                    <input value={cvc} onChange={(e) => setCvc(e.target.value)} placeholder="CVC" style={{ width: '100%', minWidth: 0, padding: 7, border: '1px solid var(--border)', borderRadius: 6 }} />
                   </div>
                   <button className="btn btn-primary" disabled={busy} onClick={handleSubscribe}>
                     {busy ? 'Processing…' : `Subscribe ($${seats * 12}/mo)`}
